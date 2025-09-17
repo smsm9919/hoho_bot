@@ -1,12 +1,1 @@
-services:
-  - type: web
-    name: pro-doge-bot
-    env: python
-    plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT runner:app
-    envVars:
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: BOT_MODULE
-        value: "bot"
+
