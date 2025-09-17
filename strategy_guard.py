@@ -1,16 +1,14 @@
 
-# strategy_guard.py
-import os, time, hashlib
+# strategy_guard.py — Balanced entries + strong anti-reverse protections
+import os, time, hashlib, pandas as pd
 from collections import deque
 
-def _fenv(k, d):
+def _fenv(k, d): 
     try: return float(os.getenv(k, d))
     except: return float(d)
-
 def _ienv(k, d):
     try: return int(os.getenv(k, d))
     except: return int(d)
-
 def _benv(k, d):
     return os.getenv(k, str(d)).strip().lower() in ("1","true","yes","y","on")
 
@@ -19,41 +17,38 @@ def _sigkey(symbol, tf, side, price):
     return hashlib.sha1(raw.encode()).hexdigest()
 
 def attach_guard(userbot):
-    # Governance
-    MAX_TRADES_PER_HOUR    = _ienv("MAX_TRADES_PER_HOUR", 3)
-    COOLDOWN_AFTER_CLOSE   = _ienv("COOLDOWN_AFTER_CLOSE", 300)
-    MIN_BARS_BETWEEN_FLIPS = _ienv("MIN_BARS_BETWEEN_FLIPS", 5)
-    # Filters
+    # Flexible but safe defaults
+    MAX_TRADES_PER_HOUR    = _ienv("MAX_TRADES_PER_HOUR", 4)
+    COOLDOWN_AFTER_CLOSE   = _ienv("COOLDOWN_AFTER_CLOSE", 420)  # 7m
+    ANTI_REENTRY_MIN_ATR   = _fenv("ANTI_REENTRY_MIN_ATR", 0.25)
     USE_FILTERS            = _benv("USE_DIRECTION_FILTERS", True)
-    MIN_ADX                = _fenv("MIN_ADX", 25.0)
-    RSI_BUY_MIN            = _fenv("RSI_BUY_MIN", 55.0)
-    RSI_SELL_MAX           = _fenv("RSI_SELL_MAX", 45.0)
-    SPIKE_ATR_MULT         = _fenv("SPIKE_ATR_MULT", 1.8)
-    MIN_TP_PERCENT         = _fenv("MIN_TP_PERCENT", 0.75)
-    # Capital
-    ENFORCE_TRADE_PORTION  = _benv("ENFORCE_TRADE_PORTION", True)
-    TARGET_TRADE_PORTION   = _fenv("TARGET_TRADE_PORTION", 0.60)
-    # Fallback ATR multipliers (if user's calc not available)
-    ATR_SL_MULT            = _fenv("ATR_SL_MULT", 0.8)
-    ATR_TP_MULT            = _fenv("ATR_TP_MULT", 1.2)
+
+    MIN_ADX       = _fenv("MIN_ADX", 20.0)
+    RSI_BUY_MIN   = _fenv("RSI_BUY_MIN", 51.0)
+    RSI_SELL_MAX  = _fenv("RSI_SELL_MAX", 49.0)
+    SPIKE_ATR_M   = _fenv("SPIKE_ATR_MULT", 1.9)
+    MIN_TP_PCNT   = _fenv("MIN_TP_PERCENT", 0.70)
+
+    ATR_PCT_MIN   = _fenv("ATR_PCT_MIN", 0.005)  # 0.50%
+    ATR_PCT_MAX   = _fenv("ATR_PCT_MAX", 0.060)  # 6%
+
+    EXP_ATR_MOVE  = _fenv("EXPLOSION_ATR_MOVE", 2.2)
+    EXP_RANGE_MOVE= _fenv("EXPLOSION_RANGE_MOVE", 2.5)
+    EXP_ATR_BOOST = _fenv("EXPLOSION_ATR_PCT_BOOST", 1.5)
+    EXP_COOLDOWN  = _ienv("COOLDOWN_EXPLOSION_BARS", 8)
+
+    ENFORCE_TP    = _benv("ENFORCE_TRADE_PORTION", True)
+    TARGET_TP     = _fenv("TARGET_TRADE_PORTION", 0.60)
 
     recent_ts = deque()
-    seen_keys = deque(maxlen=128)
-    state = {"last_close": 0.0, "last_flip_bar": -10}
+    state = {"last_close_ts": 0.0, "explosion": 0}
 
-    # enforce trade portion (no signature changes)
-    if ENFORCE_TRADE_PORTION:
+    if ENFORCE_TP:
         try:
-            setattr(userbot, "TRADE_PORTION", TARGET_TRADE_PORTION)
-            print(f"[guard] TRADE_PORTION enforced -> {TARGET_TRADE_PORTION:.2f}")
+            setattr(userbot, "TRADE_PORTION", TARGET_TP)
+            print(f"[guard] TRADE_PORTION enforced -> {TARGET_TP:.2f}")
         except Exception:
             pass
-
-    # helpers
-    def _trim_hour():
-        now = time.time()
-        while recent_ts and now - recent_ts[0] > 3600:
-            recent_ts.popleft()
 
     def _metrics():
         price  = float(getattr(userbot, "current_price", 0.0) or 0.0)
@@ -61,116 +56,113 @@ def attach_guard(userbot):
         adx    = float(getattr(userbot, "adx_value", 0.0) or 0.0)
         rsi    = float(getattr(userbot, "rsi_value", 0.0) or 0.0)
         ema200 = float(getattr(userbot, "ema_200_value", 0.0) or 0.0)
-        lastd  = getattr(userbot, "last_direction", None)
         sym    = getattr(userbot, "SYMBOL", "DOGE-USDT")
         tf     = getattr(userbot, "INTERVAL", "15m")
-        return price, atr, adx, rsi, ema200, lastd, sym, tf
+        pos    = bool(getattr(userbot, "position_open", False))
+        qty    = float(getattr(userbot, "current_quantity", 0.0) or 0.0)
+        return price, atr, adx, rsi, ema200, sym, tf, pos, qty
 
-    def _spike(curr, prev, atr):
-        try: return abs(curr - prev) > SPIKE_ATR_MULT * max(atr, 1e-9)
+    def _no_trade(msg, extra=""):
+        print(f"🚫 NO-TRADE: {msg}" + (f" | {extra}" if extra else ""))
+
+    def _spike(c, p, atr):
+        try: return abs(c - p) > SPIKE_ATR_M * max(atr, 1e-9)
         except: return False
 
     def _tp_pct(price, side, atr):
         try:
-            tp, _sl = userbot.calculate_tp_sl(price, atr if atr>0 else 1e-6, side)
+            tp, _ = userbot.calculate_tp_sl(price, atr if atr>0 else 1e-6, side)
         except Exception:
-            tp = price + ATR_TP_MULT*atr if side=="BUY" else price - ATR_TP_MULT*atr
-        try: return abs(tp - price) / max(price, 1e-9) * 100.0
-        except: return 0.0
+            tp = price + 1.2*atr if side=="BUY" else price - 1.2*atr
+        return abs(tp - price) / max(price, 1e-9) * 100.0
 
-    # patch close_position
+    # Wrap close_position for cumulative profit log
     _orig_close = userbot.close_position
     def _wrap_close(reason, exit_price):
         ok = _orig_close(reason, exit_price)
-        if ok: state["last_close"] = time.time()
+        state["last_close_ts"] = time.time()
+        try:
+            cp = float(getattr(userbot, "compound_profit", 0.0) or 0.0)
+            t  = int(getattr(userbot, "total_trades", 0) or 0)
+            w  = int(getattr(userbot, "successful_trades", 0) or 0)
+            l  = int(getattr(userbot, "failed_trades", 0) or 0)
+            print(f"💼 CLOSE [{reason}] cumulative={cp:.4f} USDT | trades {t} (W:{w}/L:{l})")
+        except Exception as e:
+            print(f"[guard] close log warn: {e}")
         return ok
     userbot.close_position = _wrap_close
 
-    # patch place_order
     _orig_place = userbot.place_order
     def _wrap_place(side, qty):
-        price, atr, adx, rsi, ema200, lastd, sym, tf = _metrics()
+        price, atr, adx, rsi, ema200, sym, tf, pos_open, cur_qty = _metrics()
+        print(f"[indicators] price={price:.6f} atr={atr:.6f} adx={adx:.2f} rsi={rsi:.2f} ema200={ema200:.6f} side={side}")
 
-        # cooldown after close
-        since_close = time.time() - state["last_close"]
+        # cooldown
+        since_close = time.time() - state["last_close_ts"]
         if since_close < COOLDOWN_AFTER_CLOSE:
-            print(f"🕒 Cooldown {int(COOLDOWN_AFTER_CLOSE - since_close)}s — skip")
-            return False
+            _no_trade("cooldown", f"remain={int(COOLDOWN_AFTER_CLOSE - since_close)}s"); return False
 
-        # rate limit
-        _trim_hour()
-        if len(recent_ts) >= MAX_TRADES_PER_HOUR:
-            print("⛔ Max trades/hour — skip")
-            return False
+        # ATR% window
+        if price <= 0:
+            _no_trade("invalid price"); return False
+        atr_pct = atr / price if price else 0.0
+        if atr_pct < ATR_PCT_MIN or atr_pct > ATR_PCT_MAX:
+            _no_trade("atr% window", f"{atr_pct:.4%} not in [{ATR_PCT_MIN:.2%},{ATR_PCT_MAX:.2%}]"); return False
 
-        # idempotency
-        skey = _sigkey(sym, tf, side, price)
-        if skey in seen_keys:
-            print("⛔ Duplicate signal — skip")
-            return False
-
-        # prevent fast flip by bars
-        try:
-            df = userbot.get_klines()
-            bar_idx = len(df) - 1 if (df is not None and len(df)) else 0
-        except Exception:
-            bar_idx = 0
-        if lastd and ((side=="BUY" and lastd=="SELL") or (side=="SELL" and lastd=="BUY")):
-            if (bar_idx - state["last_flip_bar"]) < MIN_BARS_BETWEEN_FLIPS:
-                print("⛔ Prevent fast flip — wait bars")
-                return False
-
-        # directional filters
+        # Filters
         if USE_FILTERS:
             try:
                 df = userbot.get_klines()
                 cc = float(df['close'].iloc[-1]); pc = float(df['close'].iloc[-2])
+                hi = float(df['high'].iloc[-1]);  lo = float(df['low'].iloc[-1])
             except Exception:
-                cc = price; pc = price
-            if _spike(cc, pc, atr):
-                print("⛔ Spike detected — skip")
-                return False
-            if adx < MIN_ADX:
-                print(f"⛔ Weak trend ADX {adx:.1f} < {MIN_ADX}")
-                return False
-            if side == "BUY":
-                if ema200 and not (price > ema200):
-                    print("⛔ BUY blocked: price ≤ EMA200")
-                    return False
-                if rsi < RSI_BUY_MIN:
-                    print(f"⛔ BUY blocked: RSI {rsi:.1f} < {RSI_BUY_MIN}")
-                    return False
-            else:
-                if ema200 and not (price < ema200):
-                    print("⛔ SELL blocked: price ≥ EMA200")
-                    return False
-                if rsi > RSI_SELL_MAX:
-                    print(f"⛔ SELL blocked: RSI {rsi:.1f} > {RSI_SELL_MAX}")
-                    return False
-            if _tp_pct(price, side, atr) < MIN_TP_PERCENT:
-                print("⛔ R:R too small — skip")
-                return False
+                df=None; cc=price; pc=price; hi=price; lo=price
 
-        # enforce 60% capital cap for qty sanity (with leverage)
+            if _spike(cc, pc, atr): _no_trade("spike candle"); return False
+            if adx < MIN_ADX: _no_trade("weak trend", f"ADX {adx:.1f} < {MIN_ADX}"); return False
+            if side=="BUY":
+                if ema200 and not (price>ema200): _no_trade("BUY vs EMA200"); return False
+                if rsi < RSI_BUY_MIN: _no_trade("BUY RSI", f"{rsi:.1f} < {RSI_BUY_MIN}"); return False
+            else:
+                if ema200 and not (price<ema200): _no_trade("SELL vs EMA200"); return False
+                if rsi > RSI_SELL_MAX: _no_trade("SELL RSI", f"{rsi:.1f} > {RSI_SELL_MAX}"); return False
+
+            if _tp_pct(price, side, atr) < MIN_TP_PCNT:
+                _no_trade("R:R too small"); return False
+
+            # Explosion filter
+            move_abs = abs(cc - pc); range_move = hi - lo
+            current_atr_pct = atr / max(price,1e-9)
+            try:
+                last20 = pd.Series([abs(float(df['high'].iloc[i]-df['low'].iloc[i])) for i in range(max(0,len(df)-20), len(df))]).mean()
+                avg_atr_pct = float(last20 / max(price,1e-9)) if last20 else current_atr_pct
+            except Exception:
+                avg_atr_pct = current_atr_pct
+            explosion = (move_abs >= EXP_ATR_MOVE*atr) or (range_move >= EXP_RANGE_MOVE*atr) or (current_atr_pct >= EXP_ATR_BOOST*avg_atr_pct)
+            if explosion:
+                _no_trade("explosion filter"); state["explosion"]=EXP_COOLDOWN; return False
+            if state["explosion"]>0:
+                state["explosion"]-=1; _no_trade("explosion cooldown"); return False
+
+        # Anti-reentry near entry
         try:
-            from bingx_balance import get_balance_usdt
-            bal = float(get_balance_usdt())
-            lev = float(getattr(userbot, "LEVERAGE", 1))
-            portion = TARGET_TRADE_PORTION if ENFORCE_TRADE_PORTION else float(getattr(userbot,"TRADE_PORTION", TARGET_TRADE_PORTION))
-            max_qty = round(((bal + float(getattr(userbot,"compound_profit",0.0))) * portion * lev) / max(price,1e-9), 2)
-            if qty > max_qty * 1.05:
-                print(f"⛔ Qty {qty} > max {max_qty} — skip")
-                return False
-        except Exception:
-            pass
+            ent = float(getattr(userbot,"entry_price",0.0) or 0.0)
+            if pos_open and abs(price-ent) < ANTI_REENTRY_MIN_ATR*max(atr,1e-9):
+                _no_trade("anti-reentry (near entry within ATR)"); return False
+        except Exception: pass
 
         ok = _orig_place(side, qty)
         if ok:
-            seen_keys.append(skey)
-            recent_ts.append(time.time())
-            if lastd and ((side=="BUY" and lastd=="SELL") or (side=="SELL" and lastd=="BUY")):
-                state["last_flip_bar"] = bar_idx
+            try:
+                ep = float(getattr(userbot,"entry_price",0.0) or 0.0)
+                tp = float(getattr(userbot,"tp_price",0.0) or 0.0)
+                sl = float(getattr(userbot,"sl_price",0.0) or 0.0)
+                print(f"✅ TRADE OPENED | {side} qty={qty} entry={ep:.6f} tp={tp:.6f} sl={sl:.6f} | price={price:.6f} atr={atr:.6f} adx={adx:.2f} rsi={rsi:.2f}")
+            except Exception:
+                print(f"✅ TRADE OPENED | {side} qty={qty}")
+        else:
+            _no_trade("exchange rejected/core guard")
         return ok
 
     userbot.place_order = _wrap_place
-    print("✅ strategy_guard attached (anti-reverse, cooldown, rate-limit, filters, 60% capital).")
+    print("✅ strategy_guard attached (balanced).")
